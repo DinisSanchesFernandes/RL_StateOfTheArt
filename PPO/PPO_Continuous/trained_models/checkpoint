@@ -1,0 +1,2 @@
+model_checkpoint_path: "BipedalWalker-v3_ppo_tf2_v"
+all_model_checkpoint_paths: "BipedalWalker-v3_ppo_tf2_v"

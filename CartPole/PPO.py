@@ -1,0 +1,244 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import scipy.signal
+import gym
+
+env = gym.make("CartPole-v0")
+state_space_dimensions = env.observation_space.shape[0]
+num_actions = env.action_space.n
+s = env.reset()
+
+def create_neural_network(x, sizes, activation=tf.tanh, output_activation=None):
+    # Build a feedforward neural network
+    for size in sizes[:-1]:
+        x = layers.Dense(units=size, activation=activation)(x)
+    return layers.Dense(units=sizes[-1], activation=output_activation)(x)
+
+# Define Critic
+#   =>Same Input Layer
+#   =>Squeeze 
+
+# Init Actor
+actor_nn_hiddenlayers = [64,64]
+common_input = keras.Input(shape=(state_space_dimensions,), dtype=tf.float32)
+actor_output = create_neural_network(common_input,actor_nn_hiddenlayers + [num_actions],tf.tanh,None)
+actor = keras.Model(inputs= common_input, outputs=actor_output)
+actor_lr = 3e-4
+actor_optimizer = keras.optimizers.Adam(learning_rate=actor_lr)
+
+
+#Init Critic
+critic_nn_hiddenlayers = [64,64]
+critic_output = tf.squeeze(create_neural_network(common_input, actor_nn_hiddenlayers + [1], tf.tanh, None), axis=-1)
+critic = keras.Model(inputs= common_input, outputs= critic_output)
+critic_lr = 1e-3
+critic_optimizer = keras.optimizers.Adam(learning_rate=critic_lr)
+
+def discounted_cumulative_sums(x, discount):
+    # Discounted cumulative sums of vectors for computing rewards-to-go and advantage estimates
+    return scipy.signal.lfilter([1], [1, float(-discount)], x[::-1], axis=0)[::-1]
+
+# Sample action from actor
+@tf.function
+def sample_action(observation):
+    logits = actor(observation)
+    action = tf.squeeze(tf.random.categorical(logits, 1), axis=1)
+    return logits, action
+
+def logprobabilities(logits, a):
+    # Compute the log-probabilities of taking actions a by using the logits (i.e. the output of the actor)
+    logprobabilities_all = tf.nn.log_softmax(logits)
+    logprobability = tf.reduce_sum(
+        tf.one_hot(a, num_actions) * logprobabilities_all, axis=1
+    )
+    return logprobability
+
+class Buffer:
+
+    def __init__(self, state_space_dimensions, size, gamma = 0.99, lam = 0.95):
+
+        self.reward_buffer = np.zeros(size, dtype = np.float32)
+        self.value_buffer = np.zeros(size, dtype = np.float32)
+        self.state_buffer = np.zeros((size, state_space_dimensions), dtype = np.float32)
+        self.action_buffer = np.zeros(size, dtype = np.int32)
+        self.log_logits_buffer = np.zeros(size, dtype = np.float32)
+        
+        self.return_buffer = np.zeros(size, dtype = np.float32)
+        self.advantage_buffer = np.zeros(size, dtype = np.float32)
+        self.gamma = gamma
+        self.lam = lam
+        self.pointer, self.trajectory_start_index = 0,0
+
+    def store(self, r, V_s, s, a, logits):
+
+        self.reward_buffer[self.pointer] = r
+        self.value_buffer[self.pointer] = V_s
+        self.state_buffer[self.pointer] = s
+        self.action_buffer[self.pointer] = a
+        self.log_logits_buffer[self.pointer] = logits
+
+        self.pointer += 1
+
+    def get(self):
+
+        self.pointer, self.trajectory_start_index = 0, 0
+        advantage_mean = np.mean(self.advantage_buffer)
+        advantage_deviation = np.std(self.advantage_buffer)
+
+        self.advantage_buffer = (self.advantage_buffer - advantage_mean) / advantage_deviation
+
+        return(
+            self.state_buffer,
+            self.action_buffer,
+            self.advantage_buffer,
+            self.return_buffer,
+            self.log_logits_buffer,
+        )          
+    
+    def finish_trajectory(self, r_terminal = 0):
+
+        sliced_index = slice(self.trajectory_start_index, self.pointer)
+
+        r = np.append(self.reward_buffer[sliced_index], r_terminal)
+
+        # No followinf state so:
+        # V = r + gamma V'
+        # V' = 0
+        # V = r
+        V = np.append(self.value_buffer[sliced_index], r_terminal)
+
+        deltas = r[:-1] + self.gamma * V[1:] - V[:-1]
+
+        self.advantage_buffer[sliced_index] = discounted_cumulative_sums(deltas, self.lam * self.gamma)
+
+        self.return_buffer[sliced_index] = discounted_cumulative_sums(r, self.gamma)[:-1]
+
+        self.trajectory_start_index = self.pointer
+
+@tf.function
+def train_actor(
+    observation_buffer, action_buffer, logprobability_buffer, advantage_buffer
+):
+
+    clip_ratio = 0.2
+
+
+    with tf.GradientTape() as tape:  # Record operations for automatic differentiation.
+        ratio = tf.exp(
+            logprobabilities(actor(observation_buffer), action_buffer)
+            - logprobability_buffer
+        )
+        cliped_ratio = tf.where(
+            advantage_buffer > 0,
+            (1 + clip_ratio) * advantage_buffer,
+            (1 - clip_ratio) * advantage_buffer,
+        )
+
+        actor_loss = -tf.reduce_mean(
+            tf.minimum(ratio * advantage_buffer, cliped_ratio)
+        )
+    actor_grads = tape.gradient(actor_loss, actor.trainable_variables)
+    actor_optimizer.apply_gradients(zip(actor_grads, actor.trainable_variables))
+
+    kl = tf.reduce_mean(
+        logprobability_buffer
+        - logprobabilities(actor(observation_buffer), action_buffer)
+    )
+    kl = tf.reduce_sum(kl)
+    return kl
+
+@tf.function
+def train_value_function(observation_buffer, return_buffer):
+    with tf.GradientTape() as tape:  # Record operations for automatic differentiation.
+        value_loss = tf.reduce_mean((return_buffer - critic(observation_buffer)) ** 2)
+    value_grads = tape.gradient(value_loss, critic.trainable_variables)
+    critic_optimizer.apply_gradients(zip(value_grads, critic.trainable_variables))
+
+# Hyperparameters
+epochs = 30
+epoch_steps = 4000
+
+target_kl = 0.01
+train_policy_iterations = 80
+train_value_iterations = 80
+
+total_episode_reward = 0
+
+# Init Buffer
+buffer_obj = Buffer(state_space_dimensions, epoch_steps)
+
+for epoch in range(epochs):
+
+    for t in range(epoch_steps):
+
+        s_reshaped = s.reshape(1,-1)
+
+        logits, a = sample_action(s_reshaped) 
+
+        s1, r, done, _ =  env.step(a[0].numpy())
+
+        total_episode_reward += r
+
+        V_s = critic(s_reshaped)
+
+        logits_OneHotSum_log = logprobabilities(logits,a)
+
+        buffer_obj.store(r, V_s, s, a, logits_OneHotSum_log)
+
+        s = s1
+
+        if done or t == epoch_steps - 1:
+
+            last_value = 0 if done else critic(s.reshape(1,-1))
+            buffer_obj.finish_trajectory(last_value)
+            print("Total_Reward: ", total_episode_reward)
+            s = env.reset()
+            total_episode_reward = 0
+
+
+    # Get values from the buffer
+    (
+        observation_buffer,
+        action_buffer,
+        advantage_buffer,
+        return_buffer,
+        logprobability_buffer,
+    ) = buffer_obj.get()
+
+    # Update the policy and implement early stopping using KL divergence
+    for _ in range(train_policy_iterations):
+        kl = train_actor(
+            observation_buffer, action_buffer, logprobability_buffer, advantage_buffer
+        )
+        if kl > 1.5 * target_kl:
+            # Early Stopping
+            break
+
+    # Update the value function
+    for _ in range(train_value_iterations):
+        train_value_function(observation_buffer, return_buffer)
+
+        
+
+
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
